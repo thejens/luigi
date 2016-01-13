@@ -18,6 +18,7 @@ import luigi.postgres
 from luigi.tools.range import RangeDaily
 from helpers import unittest
 import mock
+import re
 from nose.plugins.attrib import attr
 
 
@@ -35,16 +36,27 @@ class MockPostgresCursor(mock.Mock):
         self.existing = existing_update_ids
 
     def execute(self, query, params):
+        query = re.sub(r"[\t \n]+", " ", query).strip()
         if query.startswith('SELECT 1 FROM table_updates'):
-            self.fetchone_result = (1, ) if params[0] in self.existing else None
+            self.fetchone_result = (1, ) if params[0]() in self.existing else None
+        elif query.startswith(
+            "SELECT update_id FROM %s WHERE target_table = '%s'"
+        ):
+            self.fetchall_result = [(t, ) for t in self.existing]
         else:
             self.fetchone_result = None
 
     def fetchone(self):
         return self.fetchone_result
+    
+    def fetchall(self):
+        return self.fetchall_result
+    
+    def close(self):
+        pass
 
 
-class DummyPostgresImporter(luigi.postgres.CopyToTable):
+class DummyPostgresImporterNaive(luigi.postgres.CopyToTable):
     date = luigi.DateParameter()
 
     host = 'dummy_host'
@@ -57,6 +69,12 @@ class DummyPostgresImporter(luigi.postgres.CopyToTable):
         ('some_int', 'int'),
     )
 
+class DummyPostgresImporter(
+        luigi.postgres.MixinPostgresBulkComplete,
+        DummyPostgresImporterNaive
+):
+    pass
+
 
 @attr('postgres')
 class DailyCopyToTableTest(unittest.TestCase):
@@ -65,19 +83,39 @@ class DailyCopyToTableTest(unittest.TestCase):
     @mock.patch('psycopg2.connect')
     def test_bulk_complete(self, mock_connect):
         mock_cursor = MockPostgresCursor([
-            DummyPostgresImporter(date=datetime.datetime(2015, 1, 3)).task_id
+            DummyPostgresImporterNaive(date=datetime.date(2015, 1, 3)).task_id
         ])
         mock_connect.return_value.cursor.return_value = mock_cursor
 
-        task = RangeDaily(of=DummyPostgresImporter,
+        task = RangeDaily(of="DummyPostgresImporterNaive",
                           start=datetime.date(2015, 1, 2),
                           now=datetime_to_epoch(datetime.datetime(2015, 1, 7)))
         actual = sorted([t.task_id for t in task.requires()])
-
+        
         self.assertEqual(actual, sorted([
-            DummyPostgresImporter(date=datetime.datetime(2015, 1, 2)).task_id,
-            DummyPostgresImporter(date=datetime.datetime(2015, 1, 4)).task_id,
-            DummyPostgresImporter(date=datetime.datetime(2015, 1, 5)).task_id,
-            DummyPostgresImporter(date=datetime.datetime(2015, 1, 6)).task_id,
+            DummyPostgresImporterNaive(date=datetime.date(2015, 1, 2)).task_id,
+            DummyPostgresImporterNaive(date=datetime.date(2015, 1, 4)).task_id,
+            DummyPostgresImporterNaive(date=datetime.date(2015, 1, 5)).task_id,
+            DummyPostgresImporterNaive(date=datetime.date(2015, 1, 6)).task_id,
         ]))
         self.assertFalse(task.complete())
+
+
+@attr('postgres')
+class BulkCompleteMixinTest(unittest.TestCase):
+    
+    @mock.patch('psycopg2.connect')
+    def test_bulk_complete(self, mock_connect):
+        
+        mock_cursor = MockPostgresCursor(
+            [DummyPostgresImporter(date=datetime.date(2015, 1, 1)).task_id]
+        )
+        mock_connect.return_value.cursor.return_value = mock_cursor
+        complete = list(DummyPostgresImporter.bulk_complete(
+            (
+                datetime.date(2015, 1, 1),
+                datetime.date(2015, 1, 2),
+                datetime.date(2015, 1, 3),
+            )
+        ))
+        self.assertIn(datetime.date(2015, 1, 1,), complete)

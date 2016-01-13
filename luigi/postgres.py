@@ -342,3 +342,57 @@ class CopyToTable(rdbms.CopyToTable):
         connection.commit()
         connection.close()
         tmp_file.close()
+
+
+class MixinPostgresBulkComplete(object):
+    """
+    Allows to efficiently check if a range of PostgresTargets are complete.
+    This enables scheduling tasks with luigi range tools.
+
+    If you implement a custom Luigi task with a PostgresTarget output, 
+    make sure to also inherit from this mixin to improve performance of range support.
+
+    This will not work if your Luigi task outputs to different tables based on 
+    non
+    """
+
+    @classmethod
+    def bulk_complete(cls, parameter_tuples):
+        required_update_ids = []
+        for parameter_tuple in parameter_tuples:
+            if isinstance(parameter_tuple, (list, tuple)):
+                task = cls(*parameter_tuple)
+            elif isinstance(parameter_tuple, dict):
+                task = cls(**parameter_tuple)
+            else:
+                task = cls(parameter_tuple)
+            required_update_ids.append(
+                (task.update_id(), parameter_tuple)
+            )
+
+        if not required_update_ids:
+            raise StopIteration()
+
+        task_output = task.output()
+        connection = task_output.connect()
+        cursor = connection.cursor()
+        try:
+            base_query = """
+                    SELECT
+                      update_id
+                    FROM
+                      %s
+                    WHERE
+                      target_table = '%s'
+                """
+            cursor.execute(
+                base_query, 
+                (task_output.marker_table, task_output.table)
+            )
+            complete_update_ids = [i[0] for i in cursor.fetchall()]
+        finally:
+            cursor.close()
+            connection.close()
+        for required_update in required_update_ids:
+            if  required_update[0] in complete_update_ids:
+                yield required_update[1]
